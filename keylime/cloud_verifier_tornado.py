@@ -37,6 +37,7 @@ from keylime.db.keylime_db import DBEngineManager, SessionManager
 from keylime.db.verifier_db import VerfierMain, VerifierAllowlist
 from keylime.failure import MAX_SEVERITY_LABEL, Component, Event, Failure, set_severity_config
 from keylime.ima import ima
+from keylime.crypto import rsa_import_privkey, rsa_sign, get_public_key
 
 logger = keylime_logging.init_logging("verifier")
 
@@ -293,6 +294,141 @@ class VersionHandler(BaseHandler):
 
     def data_received(self, chunk: Any) -> None:
         raise NotImplementedError()
+
+def sign_and_prep(to_sign: bytes, privkey: Union[str, bytes]):
+    message = {}
+    byts: bytes
+    if isinstance(privkey, str):
+        print("reading file")
+        with open(privkey, "rb") as fobj:
+            byts = fobj.read()
+            print(byts)
+    else:
+        byts = privkey
+    private_key = rsa_import_privkey(privkey=byts)
+    message["signature"] = rsa_sign(private_key, to_sign)
+    message["public_key"] = get_public_key(private_key)
+    message["measurement_list"] = to_sign[:]
+
+    return message
+
+
+class AgentNsHandler(BaseHandler):
+    def __validate_input(self, method: str) -> Tuple[Optional[Dict[str, Union[str, None]]], Optional[str]]:
+        if self.request.uri is None:
+            web_util.echo_json_response(self, 400, "URI not specified")
+            return None, None
+
+        rest_params = web_util.get_restful_params(self.request.uri)
+        if rest_params is None:
+            web_util.echo_json_response(self, 405, "Not Implemented: Use /container/container-id")
+            return None, None
+        
+        if "container" not in rest_params:
+            web_util.echo_json_response(self, 400, "uri not supported")
+            logger.warning("%s returning 400 response. uri not supported: %s", method, self.request.path)
+            return None, None
+        
+        container_id = rest_params["container"]
+
+        if not container_id:
+            web_util.echo_json_response(self, 400, "container-id not not valid")
+            logger.error("%s received an invalid container-id: %s", method, container_id)
+            return None, None
+        
+        return rest_params, container_id
+    
+    def get(self) -> None:
+        session = get_session()
+
+        rest_params, container_id = self.__validate_input("GET")
+        if not rest_params:
+            return
+
+        if container_id is not None:
+            print("container-id found")
+            try:
+                agents = session.query(VerfierMain).all()
+            except SQLAlchemyError as e:
+                logger.error("SQLAlchemy Error: no agents found")
+            if len(agents) == 0:
+                web_util.echo_json_response(self, 500, "no agents found")
+
+            for agent in agents:
+
+                runtime_policy = verifier_read_policy_from_cache(agent)
+
+                failure = Failure(Component.INTERNAL, ["verifier"])
+
+                params = cloud_verifier_common.prepare_get_quote(agent)
+
+                kwargs = {}
+                if agent["ssl_context"]:
+                    kwargs["context"] = agent["ssl_context"]
+
+                loop = asyncio.get_event_loop()
+                res = loop.run_until_complete(tornado_requests.request(
+                    "GET",
+                    f"http://{agent['ip']}:{agent['port']}/v{agent['supported_version']}/quotes/container"
+                    f"?nonce={params['nonce']}&mask={params['mask']}"
+                    f"&partial={1}&ima_ml_entry={params['ima_ml_entry']}&containerid={container_id}",
+                    **kwargs,
+                ))
+
+                if res.status_code != 200:
+                    if res.status_code in [408, 500, 599]:
+                        asyncio.ensure_future(process_agent(agent, states.GET_QUOTE_RETRY))
+                    else:
+                        logger.critical(
+                            "Unexpected Get Quote response error for cloud agent %s, Error: %s",
+                            agent["agent_id"],
+                            res.status_code,
+                        )
+                        failure.add_event("no_quote", "Unexpected Get Quote reponse from agent", False)
+                        asyncio.ensure_future(process_agent(agent, states.FAILED, failure))
+
+                else:
+                    try:
+                        json_response = json.loads(res.body)
+
+                        if "provide_V" not in agent:
+                            agent["provide_V"] = True
+                        agentAttestState = get_AgentAttestStates().get_by_agent_id(agent["agent_id"])
+
+                        if rmc:
+                            rmc.record_create(agent, json_response, runtime_policy)
+
+                        failure = cloud_verifier_common.process_quote_response(
+                            agent,
+                            ima.deserialize_runtime_policy(runtime_policy),
+                            json_response["results"],
+                            agentAttestState,
+                        )
+                        if not failure:
+                            if agent["provide_V"]:
+                                asyncio.ensure_future(process_agent(agent, states.PROVIDE_V))
+                            else:
+                                asyncio.ensure_future(process_agent(agent, states.GET_QUOTE))
+                        else:
+                            asyncio.ensure_future(process_agent(agent, states.INVALID_QUOTE, failure))
+
+                        # store the attestation state
+                        store_attestation_state(agentAttestState)
+
+                        namespace_list_str = json_response["ima_measurement_list_namespace"]
+
+                        response = sign_and_prep(str.encode(namespace_list_str), )
+                        if response:
+                            web_util.echo_json_response(self, 200, "Success", response)
+                        else:
+                            web_util.echo_json_response(self, 400, "Not Supported")
+
+                    except Exception as e:
+                        logger.exception(e)
+                        failure.add_event(
+                            "exception", {"context": "Agent caused the verifier to throw an exception", "data": str(e)}, False
+                        )
+                        asyncio.ensure_future(process_agent(agent, states.FAILED, failure))
 
 
 class AgentsHandler(BaseHandler):
@@ -1457,6 +1593,7 @@ def main() -> None:
 
     app = tornado.web.Application(
         [
+            (r"/v?[0-9]+(?:\.[0-9]+)?/container/.*", AgentNsHandler),
             (r"/v?[0-9]+(?:\.[0-9]+)?/agents/.*", AgentsHandler),
             (r"/v?[0-9]+(?:\.[0-9]+)?/allowlists/.*", AllowlistHandler),
             (r"/versions?", VersionHandler),
