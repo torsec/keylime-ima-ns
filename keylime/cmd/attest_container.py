@@ -1,24 +1,24 @@
 from keylime import cloud_verifier_tornado, config, keylime_logging
 from keylime.common.migrations import apply
-from keylime.mba import mba
 import sys
 
 logger = keylime_logging.init_logging("verifier")
 
 
+def usage() -> None:
+    print("Please pass the container identifier to attest")
+    sys.exit(-1)
+
+
 def main() -> None:
-    # if we are configured to auto-migrate the DB, check if there are any migrations to perform
+    if len(sys.argv) < 2:
+        usage()
+    container_identifier = sys.argv[1]
+    
     if config.has_option("verifier", "auto_migrate_db") and config.getboolean("verifier", "auto_migrate_db"):
         apply("cloud_verifier")
 
-    if len(sys.argv) == 2:
-        container_id = sys.argv[1]  
-
-    # Load explicitly the policy modules into Keylime for the verifier,
-    # so that they are not loaded accidentally from other components
-    mba.load_policy_engine()
-    mba.load_parser_engine()
-    cloud_verifier_tornado.main()
+    cloud_verifier_tornado.main(container_id=int(container_identifier))
 
 
 if __name__ == "__main__":
